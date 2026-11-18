@@ -118,6 +118,62 @@ check("连续推进到结尾", $("progress-text").textContent.startsWith("15 / 1
 await until(() => $("stop-btn").hidden, "run loop finished");
 check("运行结束停止按钮隐藏", $("stop-btn").hidden);
 
+// 8b. cut-point suggestion on a real sample.
+// The repeat sample's best caption is "aabc"; ask where "aa" (split 1) ends.
+$("cut-start").value = "0";
+$("cut-start").dispatchEvent(new window.Event("input"));
+$("cut-text").value = "aabc";
+$("cut-text").dispatchEvent(new window.Event("input"));
+$("cut-split").value = "2";
+$("cut-split").dispatchEvent(new window.Event("input"));
+$("cut-btn").click();
+await until(() => !$("cut-result").hidden, "cut suggestion rendered");
+const cutFrame = $("cut-best-frame").textContent;
+const cutProb = parseFloat($("cut-best-prob").textContent);
+check("切点建议显示帧号", /第 \d+ 帧前/.test(cutFrame), cutFrame);
+check("切点建议显示概率", Number.isFinite(cutProb) && cutProb > 0 && cutProb <= 1, String(cutProb));
+check("切点表逐帧列出", $("cut-body").children.length > 0, `${$("cut-body").children.length} 行`);
+check("切点建议未标过期", $("cut-stale").hidden, $("cut-stale").textContent);
+const reportedInputs = $("cut-message").textContent;
+check("切点消息含判定", reportedInputs.length > 0, reportedInputs.slice(0, 80));
+
+// 8c. changing the split invalidates the shown suggestion immediately.
+$("cut-split").value = "1";
+$("cut-split").dispatchEvent(new window.Event("input"));
+check("改切分处后标记过期", !$("cut-stale").hidden, $("cut-stale").textContent);
+check("过期原因含切分处", $("cut-stale").textContent.includes("切分处"), $("cut-stale").textContent);
+
+// 8d. advancing invalidates a current suggestion on the server side.
+$("cut-split").value = "2";
+$("cut-split").dispatchEvent(new window.Event("input"));
+$("cut-btn").click();
+await until(() => $("cut-stale").hidden && !$("cut-result").hidden && !$("cut-btn").disabled,
+  "fresh cut suggestion");
+check("重新计算后不再过期", $("cut-stale").hidden);
+
+// 8e. an invalid request keeps the previous suggestion and explains why.
+const keptFrame = $("cut-best-frame").textContent;
+$("cut-text").value = "aazz";
+$("cut-text").dispatchEvent(new window.Event("input"));
+$("cut-btn").click();
+await until(() => !$("cut-failure").hidden && !$("op-error").hidden, "cut failure shown");
+check("非法切点请求显示原因", !$("cut-failure").hidden, $("cut-failure").textContent);
+check("非法请求后旧建议仍在", !$("cut-result").hidden && $("cut-best-frame").textContent === keptFrame,
+  `${keptFrame} -> ${$("cut-best-frame").textContent}`);
+
+// 8f. a request whose highest probability is below 0.8 is shown as unsuitable.
+$("cut-text").value = "ba";
+$("cut-text").dispatchEvent(new window.Event("input"));
+$("cut-split").value = "1";
+$("cut-split").dispatchEvent(new window.Event("input"));
+$("cut-btn").click();
+await until(() => $("cut-best-verdict").textContent === "不宜切开" && $("cut-stale").hidden,
+  "unsuitable cut reported");
+check("低于阈值提示不宜切开", $("cut-best-verdict").textContent === "不宜切开",
+  $("cut-best-verdict").textContent);
+check("不宜切开仍显示最高概率", $("cut-message").textContent.includes("最高条件概率"),
+  $("cut-message").textContent);
+
 // 9. zero-probability sample shows -∞ without NaN
 const zeroBtn = [...$("sample-buttons").children].find((b) => b.textContent.includes("sparse_zero"));
 zeroBtn.click();

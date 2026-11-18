@@ -177,6 +177,47 @@ button.sample { padding: 5px 10px; font-size: 12px; }
 .history-list .h-prefix { font-family: var(--mono); color: var(--accent); }
 .history-list .h-meta { color: var(--muted); font-size: 12px; font-family: var(--mono); }
 
+/* cut-point suggestion */
+.grid.four { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+.grid.four input[type="number"] {
+  width: 100%; padding: 9px 11px; background: #12171d; color: var(--text);
+  border: 1px solid var(--line); border-radius: 8px; font-size: 15px; font-family: var(--mono);
+}
+.grid.four input[type="number"]:focus { outline: 2px solid rgba(79, 209, 197, .35); }
+.cut { grid-column: 1 / -1; }
+.cut-result { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 14px; }
+.cut-best {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px;
+}
+.cut-score {
+  background: #12171d; border: 1px solid var(--line); border-radius: 8px;
+  padding: 9px 11px; display: flex; flex-direction: column; gap: 4px; min-width: 0;
+}
+.cut-score .cut-value { font-size: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#cut-best[data-verdict="good"] .cut-score { border-color: rgba(79, 209, 197, .5); }
+#cut-best[data-verdict="bad"] .cut-score { border-color: rgba(255, 122, 133, .5); }
+#cut-best[data-verdict="good"] #cut-best-verdict { color: var(--accent); }
+#cut-best[data-verdict="bad"] #cut-best-verdict { color: var(--danger); }
+.cut-message { margin-top: 12px; font-size: 13.5px; color: var(--text); }
+.cut-stale {
+  margin-top: 10px; font-size: 13px; color: var(--warn);
+  border-left: 3px solid rgba(255, 201, 120, .6); padding-left: 10px;
+}
+.cut-failure {
+  margin-top: 12px; font-size: 13px; color: var(--danger);
+  border-left: 3px solid rgba(255, 122, 133, .6); padding-left: 10px;
+}
+.cut-empty { margin-top: 12px; color: var(--muted); font-size: 13px; }
+.cut-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 14px; }
+.cut-table th {
+  text-align: left; color: var(--muted); font-weight: 500; font-size: 11.5px;
+  padding: 6px 8px; border-bottom: 1px solid var(--line);
+}
+.cut-table td { padding: 6px 8px; border-bottom: 1px solid rgba(42, 50, 61, .55); }
+.cut-table td.num, .cut-table th.num { text-align: right; font-family: var(--mono); }
+.cut-table tr.recommended { background: rgba(79, 209, 197, .09); }
+.cut-table tr.zero td { color: #6b7787; }
+
 .busy {
   position: fixed; right: 22px; bottom: 22px; display: flex; align-items: center; gap: 10px;
   background: #10151b; border: 1px solid var(--line); border-radius: 999px;

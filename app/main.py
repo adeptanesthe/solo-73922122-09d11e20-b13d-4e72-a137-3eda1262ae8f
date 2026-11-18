@@ -68,6 +68,14 @@ class UndoBody(BaseModel):
     session_id: str
 
 
+class CutSuggestionBody(BaseModel):
+    session_id: str
+    start_frame: int
+    end_frame: int
+    text: str
+    split: int
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 
@@ -264,6 +272,47 @@ async def confirm_endpoint(body: ConfirmBody) -> dict:
 async def undo_endpoint(body: UndoBody) -> dict:
     session = _session_or_404(body.session_id)
     return await _run_op(session, state_module.undo)
+
+
+@app.post("/api/cut-suggestion")
+async def cut_suggestion_endpoint(body: CutSuggestionBody) -> dict:
+    """Suggest an acoustic cut frame for ``text[:split] | text[split:]``.
+
+    The request is stamped *now* (synchronously, on the event loop) so a slow
+    computation that was superseded by a newer request is labelled
+    ``superseded`` even though the worker finishes it first-in-first-out.  The
+    response also carries the session snapshot so the client sees the current
+    suggestion together with the state it was computed against.
+    """
+    session = _session_or_404(body.session_id)
+    # Shape-independent validation first: a rejected request must not bump the
+    # request stamp and thereby invalidate a valid computation already running.
+    try:
+        state_module.validate_cut_request(
+            session, body.start_frame, body.end_frame, body.text, body.split
+        )
+    except SessionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except DecodeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    order = state_module.begin_cut_request(session)
+
+    def run(sess):
+        result = state_module.cut_suggestion(
+            sess, order, body.start_frame, body.end_frame, body.text, body.split
+        )
+        return {
+            "result": result,
+            "state": _with_meta(sess, sess.state()),
+        }
+
+    future = manager.submit(session, run)
+    try:
+        return await asyncio.wrap_future(future)
+    except SessionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except DecodeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------

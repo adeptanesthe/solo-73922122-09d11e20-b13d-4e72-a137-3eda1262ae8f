@@ -34,6 +34,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 
+from .cuts import compute_cut_suggestion, validate_cut_inputs
 from .decoder import (
     Beam,
     CTCBeamDecoder,
@@ -87,6 +88,19 @@ class Session:
     seq: int = 0
     revision: int = 0
     error: Optional[str] = None
+    # Cut suggestions.  Requests are stamped with an increasing ``cut_order``
+    # on receipt; a slower, older request may finish after a newer one and is
+    # then reported as superseded instead of becoming the current suggestion.
+    # ``cut_current`` keeps the last *successful* suggestion even when a later
+    # attempt fails, so the UI can retain it and explain the failure.
+    cut_order: int = 0
+    cut_current_order: int = 0
+    cut_current: Optional[dict] = None
+    cut_failure: Optional[dict] = None
+    # Guards only the request stamp.  It must never be ``lock``: a long cut
+    # computation holds ``lock`` on the worker, and stamping a new request must
+    # be immediate, otherwise the event loop would wait for the old result.
+    cut_stamp_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     # Single worker => operations apply in submission order.
     executor: ThreadPoolExecutor = field(
         default_factory=lambda: ThreadPoolExecutor(max_workers=1, thread_name_prefix="ctc"),
@@ -147,8 +161,42 @@ class Session:
             "best_text": self.best_text(),
             "beams": [beam_to_dict(b) for b in self.beams],
             "confirmations": [confirmation_to_dict(c) for c in self.confirmations],
+            "cut_suggestion": self.cut_suggestion_view(),
+            "cut_failure": copy.deepcopy(self.cut_failure),
             "error": self.error,
         }
+
+    def cut_suggestion_view(self) -> Optional[dict]:
+        """The last successful cut suggestion, with a staleness verdict.
+
+        The recorded inputs are echoed so the UI can show exactly which values
+        the suggestion belongs to and can invalidate it the moment a form
+        field is edited locally.  Advancing frames or changing the confirmed
+        prefix invalidates every suggestion: its segment may still exist, but
+        the caption context it was requested for has moved on.
+        """
+        if self.cut_current is None:
+            return None
+        view = copy.deepcopy(self.cut_current)
+        reasons: List[str] = []
+        computed_at = view.get("computed_at") or {}
+        if computed_at.get("next_frame") != self.next_frame:
+            reasons.append("继续推进了帧")
+        if computed_at.get("prefix") != self.prefix:
+            reasons.append("已确认字幕发生变化")
+        if self.cut_current_order < self.current_cut_order():
+            # A newer request was accepted (for other segment / text / split
+            # inputs), so this older suggestion no longer answers the current
+            # question even while the new computation is still running.
+            reasons.append("已有更新的切点请求")
+        view["stale"] = bool(reasons)
+        view["stale_reasons"] = reasons
+        return view
+
+    def current_cut_order(self) -> int:
+        """Latest accepted cut-request stamp (safe to read from any thread)."""
+        with self.cut_stamp_lock:
+            return self.cut_order
 
     def prefix_score_view(self) -> Optional[dict]:
         """Retained blank / non-blank path mass of the confirmed last character.
@@ -436,3 +484,88 @@ def undo(session: Session) -> None:
     session.beams = beams
     session.revision += 1
     session.error = None
+
+
+# ---------------------------------------------------------------------------
+# Cut-point suggestions.  These are *not* mutating session operations: they
+# never change frames, beams or the confirmed prefix, and they do not touch
+# ``revision``.  They are still queued on the session's worker so that the
+# frames / prefix they read cannot change underneath them.
+
+
+def begin_cut_request(session: Session) -> int:
+    """Stamp a newly received cut request; older, slower requests lose.
+
+    Called synchronously when the HTTP request is accepted.  Because the
+    session worker may already be busy with an earlier, slower request, the
+    stamp (and not completion order) decides which result is current.
+    """
+    with session.cut_stamp_lock:
+        session.cut_order += 1
+        return session.cut_order
+
+
+def validate_cut_request(
+    session: Session, start_frame, end_frame, text, split
+) -> None:
+    """Shape rules plus the "already advanced" rule for one cut request.
+
+    Called on the event loop before the request is stamped and queued, so an
+    invalid request is rejected immediately and does not mark a running valid
+    computation as superseded.
+    """
+    validate_cut_inputs(session.vocab, start_frame, end_frame, text, split)
+    if session.next_frame <= 0:
+        raise SessionError("尚未推进任何帧，无法选择片段")
+    if end_frame >= session.next_frame:
+        raise SessionError("片段必须位于已经推进过的帧内")
+
+
+def cut_suggestion(
+    session: Session, order: int, start_frame, end_frame, text, split
+) -> dict:
+    """Compute and (if still current) publish one cut suggestion.
+
+    Returns the same payload shape for every status.  ``superseded`` is true
+    when a newer request was stamped before this one finished; such a result is
+    never shown as the current suggestion.  ``all_zero`` and ``unreachable``
+    keep the previous successful suggestion in place and record the reason in
+    ``session.cut_failure``.
+    """
+    validate_cut_request(session, start_frame, end_frame, text, split)
+
+    result = compute_cut_suggestion(
+        session.probs[start_frame : end_frame + 1],
+        session.vocab,
+        start_frame,
+        end_frame,
+        text,
+        split,
+    )
+    result["order"] = order
+    # Compare against the latest stamp.  New requests are stamped without
+    # taking the session lock, so they may arrive at any moment; an older
+    # completion must not become the current suggestion.
+    result["superseded"] = order < session.current_cut_order()
+    result["computed_at"] = {
+        "next_frame": session.next_frame,
+        "prefix": session.prefix,
+    }
+
+    if not result["superseded"]:
+        if result["status"] == "ok" and result.get("best") is not None:
+            session.cut_current = copy.deepcopy(result)
+            session.cut_current_order = order
+            session.cut_failure = None
+        else:
+            # Keep the previous suggestion; explain why this attempt produced
+            # no usable cut.
+            session.cut_failure = {
+                "order": order,
+                "status": result["status"],
+                "message": result["message"],
+                "inputs": copy.deepcopy(result["inputs"]),
+                "zero_frame": result.get("zero_frame"),
+                "computed_at": copy.deepcopy(result["computed_at"]),
+            }
+    return result

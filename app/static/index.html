@@ -141,8 +141,72 @@
       </div>
     </div>
 
+    <div class="panel cut">
+      <div class="panel-head">
+        <h2>4. 切点建议</h2>
+        <span class="hint" id="cut-range-hint">片段须在已推进的帧内，2～64 帧</span>
+      </div>
+
+      <div class="grid four">
+        <label class="field">
+          <span>片段起始帧</span>
+          <input type="number" id="cut-start" min="0" step="1" value="0">
+        </label>
+        <label class="field">
+          <span>片段结束帧（含）</span>
+          <input type="number" id="cut-end" min="1" step="1" value="0">
+        </label>
+        <label class="field grow">
+          <span>字幕 <em>（2～16 个词表内单字）</em></span>
+          <input type="text" id="cut-text" autocomplete="off" spellcheck="false" placeholder="例如：阿波">
+        </label>
+        <label class="field">
+          <span>切分处 <em>（第几个字之后）</em></span>
+          <input type="number" id="cut-split" min="1" step="1" value="1">
+        </label>
+      </div>
+
+      <div class="row wrap">
+        <button class="primary" id="cut-btn" disabled>计算切点建议</button>
+        <span class="hint" id="cut-split-preview">—</span>
+      </div>
+
+      <div class="cut-result" id="cut-result" hidden>
+        <div class="cut-best" id="cut-best">
+          <div class="cut-score">
+            <span class="score-label">建议切点</span>
+            <span class="cut-value mono" id="cut-best-frame">—</span>
+          </div>
+          <div class="cut-score">
+            <span class="score-label">条件概率</span>
+            <span class="cut-value mono" id="cut-best-prob">—</span>
+          </div>
+          <div class="cut-score">
+            <span class="score-label">判定</span>
+            <span class="cut-value" id="cut-best-verdict">—</span>
+          </div>
+        </div>
+        <p class="cut-message" id="cut-message"></p>
+        <p class="cut-stale" id="cut-stale" hidden></p>
+        <table class="cut-table">
+          <thead>
+            <tr>
+              <th>切在帧前</th>
+              <th class="num">左侧帧</th>
+              <th class="num">条件概率</th>
+              <th class="num">log 条件概率</th>
+            </tr>
+          </thead>
+          <tbody id="cut-body"></tbody>
+        </table>
+      </div>
+
+      <p class="cut-failure" id="cut-failure" hidden></p>
+      <p class="cut-empty" id="cut-empty">尚未计算切点建议。</p>
+    </div>
+
     <div class="panel history">
-      <h2>4. 确认历史</h2>
+      <h2>5. 确认历史</h2>
       <ol class="history-list" id="history-list"></ol>
       <p class="empty" id="history-empty">还没有确认过前缀。</p>
     </div>

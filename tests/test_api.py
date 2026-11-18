@@ -213,6 +213,239 @@ def test_manager_cleanup_after_delete(client):
     assert client.get(f"/api/sessions/{sid}").status_code == 404
 
 
+# ------------------------------------------------------------------ cut points
+
+
+CUT_FRAMES = [
+    [0.005, 0.99, 0.005],
+    [0.98, 0.01, 0.01],
+    [0.005, 0.005, 0.99],
+    [0.99, 0.005, 0.005],
+    [0.99, 0.005, 0.005],
+]
+
+
+def cut(client, sid, start, end, text, split):
+    return client.post(
+        "/api/cut-suggestion",
+        json={
+            "session_id": sid,
+            "start_frame": start,
+            "end_frame": end,
+            "text": text,
+            "split": split,
+        },
+    )
+
+
+def test_cut_suggestion_over_http(client):
+    session = create(client, frames=CUT_FRAMES)
+    sid = session["session_id"]
+    client.post("/api/advance", json={"session_id": sid, "to_frame": len(CUT_FRAMES)})
+
+    response = cut(client, sid, 0, 4, "ab", 1)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    result = payload["result"]
+    assert result["status"] == "ok"
+    assert result["best"]["cut_frame"] == 2
+    assert result["suitable"] is True
+    assert result["inputs"]["first_half"] == "a"
+    assert result["inputs"]["second_half"] == "b"
+    assert result["superseded"] is False
+    # The response carries a session snapshot so the UI can show the suggestion
+    # together with the state it belongs to.
+    assert payload["state"]["cut_suggestion"]["best"]["cut_frame"] == 2
+    assert payload["state"]["cut_suggestion"]["stale"] is False
+    # A cut suggestion must not mutate the decode state.
+    assert payload["state"]["next_frame"] == len(CUT_FRAMES)
+    assert payload["state"]["prefix"] == ""
+
+
+def test_cut_suggestion_requires_advanced_frames(client):
+    session = create(client, frames=CUT_FRAMES)
+    sid = session["session_id"]
+    client.post("/api/advance", json={"session_id": sid, "to_frame": 2})
+    # End frame not yet advanced.
+    assert cut(client, sid, 0, 4, "ab", 1).status_code == 409
+    # Nothing advanced at all.
+    fresh = create(client, frames=CUT_FRAMES)
+    assert cut(client, fresh["session_id"], 0, 1, "ab", 1).status_code == 409
+
+
+def test_cut_suggestion_validation_leaves_session_untouched(client):
+    session = create(client, frames=CUT_FRAMES)
+    sid = session["session_id"]
+    client.post("/api/advance", json={"session_id": sid, "to_frame": 5})
+    before = client.get(f"/api/sessions/{sid}").json()
+
+    for start, end, text, split in (
+        (0, 4, "a", 1),          # text too short
+        (0, 4, "ab", 0),         # split out of range
+        (0, 4, "ab", 2),         # split out of range
+        (0, 4, "az", 1),         # out of vocabulary
+        (0, 4, "a" * 17, 1),     # text too long
+        (0, 0, "ab", 1),         # segment too short
+        (0, 64, "ab", 1),        # segment too long
+        (-1, 4, "ab", 1),        # negative start
+    ):
+        assert cut(client, sid, start, end, text, split).status_code == 400, (
+            start,
+            end,
+            text,
+            split,
+        )
+    after = client.get(f"/api/sessions/{sid}").json()
+    assert after == before
+
+
+def test_cut_failure_keeps_previous_suggestion(client):
+    session = create(client, frames=CUT_FRAMES)
+    sid = session["session_id"]
+    client.post("/api/advance", json={"session_id": sid, "to_frame": 5})
+    first = cut(client, sid, 0, 4, "ab", 1).json()
+    assert first["result"]["status"] == "ok"
+
+    # A zero-probability frame inside a segment means it has no distribution.
+    zero_frames = [[0.5, 0.5, 0.0], [0.0, 0.0, 0.0], [0.5, 0.5, 0.0]]
+    other = create(client, frames=zero_frames)
+    other_sid = other["session_id"]
+    client.post("/api/advance", json={"session_id": other_sid, "to_frame": 3})
+    zero = cut(client, other_sid, 0, 2, "ab", 1).json()["result"]
+    assert zero["status"] == "all_zero"
+    assert zero["zero_frame"] == 1
+    state = client.get(f"/api/sessions/{other_sid}").json()
+    assert state["cut_suggestion"] is None
+    assert state["cut_failure"]["status"] == "all_zero"
+    assert "1" in state["cut_failure"]["message"]
+
+
+def test_cut_failure_keeps_previous_successful_suggestion(client):
+    session = create(client, frames=CUT_FRAMES)
+    sid = session["session_id"]
+    client.post("/api/advance", json={"session_id": sid, "to_frame": 5})
+    ok = cut(client, sid, 0, 4, "ab", 1).json()
+    assert ok["result"]["status"] == "ok"
+    # In the same session a caption with an impossible repeat is unreachable;
+    # the earlier suggestion must survive and the failure must explain why.
+    bad = cut(client, sid, 0, 1, "aa", 1).json()
+    assert bad["result"]["status"] == "unreachable"
+    state = client.get(f"/api/sessions/{sid}").json()
+    assert state["cut_suggestion"]["inputs"]["text"] == "ab"
+    assert state["cut_suggestion"]["best"]["cut_frame"] == 2
+    assert state["cut_failure"]["status"] == "unreachable"
+
+
+def test_advancing_marks_suggestion_stale(client):
+    # A longer fixture so there are still frames left to advance.
+    frames = CUT_FRAMES * 3
+    session = create(client, frames=frames)
+    sid = session["session_id"]
+    client.post("/api/advance", json={"session_id": sid, "to_frame": 5})
+    result = cut(client, sid, 0, 4, "ab", 1).json()["result"]
+    assert result["status"] == "ok"
+    state = client.get(f"/api/sessions/{sid}").json()
+    assert state["cut_suggestion"]["stale"] is False
+
+    client.post("/api/advance", json={"session_id": sid, "to_frame": 6})
+    state = client.get(f"/api/sessions/{sid}").json()
+    assert state["cut_suggestion"]["stale"] is True
+    assert "继续推进了帧" in state["cut_suggestion"]["stale_reasons"]
+
+
+def test_confirmation_marks_suggestion_stale(client):
+    session = create(client, frames=CUT_FRAMES * 2)
+    sid = session["session_id"]
+    client.post("/api/advance", json={"session_id": sid, "to_frame": 5})
+    assert cut(client, sid, 0, 4, "ab", 1).json()["result"]["status"] == "ok"
+    state = client.get(f"/api/sessions/{sid}").json()
+    target = state["beams"][0]["text"]
+    assert target
+    client.post("/api/confirm", json={"session_id": sid, "prefix": target})
+    state = client.get(f"/api/sessions/{sid}").json()
+    assert state["cut_suggestion"]["stale"] is True
+    assert "已确认字幕发生变化" in state["cut_suggestion"]["stale_reasons"]
+
+
+def test_late_cut_result_is_superseded_not_current(client, monkeypatch):
+    """A slow older request must not replace the newer current suggestion.
+
+    The request stamp is taken when the HTTP request is accepted, so despite
+    the single worker finishing the older computation, its result is reported
+    as superseded and the session keeps the newer suggestion.
+    """
+    import asyncio
+    import time
+
+    import httpx
+
+    from app import state as state_module
+
+    original = state_module.compute_prefix_alpha
+    calls = {"slow": True}
+
+    # Make only the first computation slow; the second is fast.
+    def slow_first(frames, ids):
+        if calls["slow"]:
+            calls["slow"] = False
+            time.sleep(0.4)
+        return original(frames, ids)
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            created = (
+                await client.post(
+                    "/api/sessions",
+                    json={"vocab": VOCAB, "beam_width": 4, "frames": CUT_FRAMES},
+                )
+            ).json()
+            sid = created["session_id"]
+            await client.post("/api/advance", json={"session_id": sid, "to_frame": 5})
+
+            # Patch the function used inside cuts.py for the duration.
+            import app.cuts as cuts_module
+
+            monkeypatch.setattr(cuts_module, "compute_prefix_alpha", slow_first)
+
+            first = asyncio.create_task(
+                client.post(
+                    "/api/cut-suggestion",
+                    json={
+                        "session_id": sid,
+                        "start_frame": 0,
+                        "end_frame": 4,
+                        "text": "ab",
+                        "split": 1,
+                    },
+                )
+            )
+            await asyncio.sleep(0.05)
+            second = asyncio.create_task(
+                client.post(
+                    "/api/cut-suggestion",
+                    json={
+                        "session_id": sid,
+                        "start_frame": 1,
+                        "end_frame": 4,
+                        "text": "ab",
+                        "split": 1,
+                    },
+                )
+            )
+            first_response, second_response = await asyncio.gather(first, second)
+            state = (await client.get(f"/api/sessions/{sid}")).json()
+            return first_response, second_response, state
+
+    first_response, second_response, state = asyncio.run(scenario())
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert first_response.json()["result"]["superseded"] is True
+    assert second_response.json()["result"]["superseded"] is False
+    # The newer request's inputs own the current suggestion.
+    assert state["cut_suggestion"]["inputs"]["start_frame"] == 1
+
+
 def test_slow_recompute_does_not_swallow_later_actions(monkeypatch):
     """A slow undo replay must not lose an advance issued while it runs.
 

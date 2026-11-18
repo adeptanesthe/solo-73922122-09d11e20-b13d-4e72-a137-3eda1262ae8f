@@ -53,6 +53,23 @@
     frameProbs: $("frame-probs"),
     historyList: $("history-list"),
     historyEmpty: $("history-empty"),
+    cutStart: $("cut-start"),
+    cutEnd: $("cut-end"),
+    cutText: $("cut-text"),
+    cutSplit: $("cut-split"),
+    cutBtn: $("cut-btn"),
+    cutRangeHint: $("cut-range-hint"),
+    cutSplitPreview: $("cut-split-preview"),
+    cutResult: $("cut-result"),
+    cutBest: $("cut-best"),
+    cutBestFrame: $("cut-best-frame"),
+    cutBestProb: $("cut-best-prob"),
+    cutBestVerdict: $("cut-best-verdict"),
+    cutMessage: $("cut-message"),
+    cutStale: $("cut-stale"),
+    cutBody: $("cut-body"),
+    cutFailure: $("cut-failure"),
+    cutEmpty: $("cut-empty"),
     busy: $("busy"),
     busyText: $("busy-text"),
   };
@@ -67,6 +84,14 @@
     runAbort: false,
     pending: 0,
     samples: [],
+    // Cut suggestions: the shown result is only accepted while it belongs to
+    // the session and to the inputs currently typed in the form.  Each
+    // keystroke or frame edit bumps ``cutSerial`` so a late reply cannot pose
+    // as an answer to the current inputs.
+    cutSerial: 0,
+    cutInFlight: 0,
+    cutExternal: null,   // suggestion kept by the server (last successful one)
+    cutEndAuto: true,    // segment end follows the advanced range until edited
     // Behind the scenes: the last shown state is kept while a request is in
     // flight, so a failed operation leaves the subtitles and progress intact.
     peekLive: false,
@@ -150,6 +175,7 @@
     els.applyPrefix.disabled = !ready;
     els.stopBtn.hidden = !state.running;
     els.resetBtn.disabled = !ready;
+    updateCutButtons();
   }
 
   async function api(path, options = {}) {
@@ -193,6 +219,19 @@
     state.snapshot = null;
     state.loadedSample = sampleName;
     state.peekLive = true;
+    // A new session invalidates every cut suggestion and any reply in flight.
+    state.cutSerial += 1;
+    state.cutInFlight = 0;
+    state.cutExternal = null;
+    els.cutResult.hidden = true;
+    els.cutEmpty.hidden = false;
+    els.cutEmpty.textContent = "尚未计算切点建议。";
+    els.cutFailure.hidden = true;
+    els.cutText.value = "";
+    els.cutSplit.value = "1";
+    els.cutStart.value = "0";
+    state.cutEndAuto = true;
+    els.cutEnd.value = "1";
     applyState(payload, { force: true });
     if (state.snapshot) {
       els.peekFrame.value = "0";
@@ -249,8 +288,28 @@
     renderHistory(snap);
     renderFrameProbs(snap.frame_info);
     els.prefixInput.placeholder = prefix ? `当前前缀：${prefix}` : "例如：啊";
+    renderCut(snap);
     updateButtons();
     updateStatusFromSnapshot();
+  }
+
+  function renderCut(snap) {
+    updateCutRangeHint();
+    // While the end field has not been edited by hand, keep it on the last
+    // advanced frame so "current segment" stays meaningful as frames arrive.
+    if (state.cutEndAuto) {
+      const liveEnd = Math.max(1, snap.next_frame - 1);
+      els.cutEnd.value = String(liveEnd);
+    }
+    updateCutSplitPreview();
+    // The server keeps the last successful suggestion (and the reason a later
+    // attempt failed).  Adopt it unless this tab already holds a newer one.
+    adoptServerCutSuggestion(snap);
+    // Always re-render: advancing, confirming or editing an input must mark
+    // the displayed suggestion as stale even without a new computation.
+    if (state.cutExternal) renderCutSuggestion(state.cutExternal);
+    else renderCutSuggestion(null);
+    renderCutFailure(snap.cut_failure);
   }
 
   function renderBeams(snap, prefix) {
@@ -356,6 +415,273 @@
       cell.title = `log P = ${info.log_probs && info.log_probs[index] !== null ? Number(info.log_probs[index]).toFixed(4) : "-∞"}`;
       els.frameProbs.appendChild(cell);
     });
+  }
+
+  // -------------------------------------------------------- cut suggestions
+
+  // The inputs a suggestion belongs to, in the same normalised form the
+  // server echoes back.  Comparing these makes local edits (segment, text or
+  // split) invalidate the displayed suggestion immediately.
+  function readCutInputs() {
+    const start = els.cutStart.value.trim();
+    const end = els.cutEnd.value.trim();
+    const split = els.cutSplit.value.trim();
+    return {
+      start_frame: start === "" ? null : Number(start),
+      end_frame: end === "" ? null : Number(end),
+      text: els.cutText.value.trim(),
+      split: split === "" ? null : Number(split),
+    };
+  }
+
+  function sameCutInputs(a, b) {
+    if (!a || !b) return false;
+    return a.start_frame === b.start_frame
+      && a.end_frame === b.end_frame
+      && a.text === b.text
+      && a.split === b.split;
+  }
+
+  // A shown result is "current" only if it was computed for the inputs that
+  // are in the form right now.  Anything else is stale.
+  function cutIsStale(result) {
+    if (!result) return true;
+    if (result.stale) return true;   // verdict recorded by the server
+    const live = readCutInputs();
+    if (!result.inputs) return true;
+    if (!sameCutInputs(result.inputs, live)) return true;
+    if (state.snapshot && result.computed_at
+        && result.computed_at.next_frame !== state.snapshot.next_frame) return true;
+    if (state.snapshot && result.computed_at
+        && result.computed_at.prefix !== (state.snapshot.prefix || "")) return true;
+    return false;
+  }
+
+  function staleReasonLabel(result) {
+    const live = readCutInputs();
+    const inputs = (result && result.inputs) || {};
+    const reasons = [];
+    if (inputs.start_frame !== live.start_frame || inputs.end_frame !== live.end_frame) {
+      reasons.push("片段已更改");
+    }
+    if (inputs.text !== live.text) reasons.push("字幕已更改");
+    if (inputs.split !== live.split) reasons.push("切分处已更改");
+    if (state.snapshot && result && result.computed_at) {
+      if (result.computed_at.next_frame !== state.snapshot.next_frame) reasons.push("已继续推进帧");
+      if (result.computed_at.prefix !== (state.snapshot.prefix || "")) reasons.push("已确认字幕已变化");
+    }
+    (result && result.stale_reasons ? result.stale_reasons : []).forEach((reason) => {
+      if (!reasons.includes(reason)) reasons.push(reason);
+    });
+    return reasons;
+  }
+
+  function updateCutButtons() {
+    // Deliberately stays enabled while a computation runs: submitting newer
+    // inputs must supersede the running request (the server stamps requests
+    // on arrival and labels the older result ``superseded``).
+    const ready = !!state.sessionId && !!state.snapshot;
+    const enough = ready && state.snapshot.next_frame >= 2;
+    els.cutBtn.disabled = !enough;
+    els.cutBtn.title = enough ? "" : "至少推进 2 帧后才能计算切点";
+    els.cutBtn.textContent = state.cutInFlight > 0 ? "重新计算切点（有计算进行中）" : "计算切点建议";
+  }
+
+  function updateCutRangeHint() {
+    const snap = state.snapshot;
+    if (!snap) {
+      els.cutRangeHint.textContent = "片段须在已推进的帧内，2～64 帧";
+      return;
+    }
+    const advanceable = snap.next_frame - 1;
+    els.cutRangeHint.textContent = advanceable >= 1
+      ? `可用帧 0～${advanceable}（已推进 ${snap.next_frame} 帧，片段 2～64 帧）`
+      : "至少推进 2 帧后才能选择片段";
+  }
+
+  function updateCutSplitPreview() {
+    const text = els.cutText.value.trim();
+    const splitValue = Number(els.cutSplit.value);
+    if (!text) { els.cutSplitPreview.textContent = "—"; return; }
+    if (!Number.isInteger(splitValue) || splitValue < 1 || splitValue >= text.length) {
+      els.cutSplitPreview.textContent = `切分处须在 1～${Math.max(0, text.length - 1)} 之间`;
+      return;
+    }
+    els.cutSplitPreview.textContent = `左：“${text.slice(0, splitValue)}”　右：“${text.slice(splitValue)}”`;
+  }
+
+  function renderCutFailure(failure) {
+    if (!failure || !failure.message) {
+      els.cutFailure.hidden = true;
+      els.cutFailure.textContent = "";
+      return;
+    }
+    els.cutFailure.hidden = false;
+    els.cutFailure.textContent = failure.message;
+  }
+
+  function renderCutSuggestion(result) {
+    if (!result) {
+      els.cutResult.hidden = true;
+      els.cutEmpty.hidden = false;
+      els.cutEmpty.textContent = "尚未计算切点建议。";
+      return;
+    }
+    els.cutResult.hidden = false;
+    els.cutEmpty.hidden = true;
+    const stale = cutIsStale(result);
+    const best = result.best;
+    const inputs = result.inputs || {};
+    // A suggestion whose status is not "ok" has no cut to recommend; it is
+    // still displayed (with its explanation) but never as usable.
+    const suitable = result.status === "ok" && !!best && !!result.suitable;
+    els.cutBest.dataset.verdict = suitable ? "good" : "bad";
+    if (best) {
+      els.cutBestFrame.textContent = `第 ${best.cut_frame} 帧前`;
+      els.cutBestFrame.title =
+        `左侧 ${inputs.start_frame}～${best.prev_frame} 帧（“${inputs.first_half}”），` +
+        `右侧 ${best.cut_frame}～${inputs.end_frame} 帧（“${inputs.second_half}”）`;
+      els.cutBestProb.textContent = best.probability.toFixed(4);
+      els.cutBestProb.title =
+        `P(切于此 | 片段折叠为全文) = ${best.probability.toFixed(6)}；` +
+        `log = ${fmt(best.log_probability)}。阈值 ${result.threshold}。`;
+      els.cutBestVerdict.textContent = suitable ? "可以切开" : "不宜切开";
+      els.cutBestVerdict.title = suitable
+        ? `条件概率不低于阈值 ${result.threshold}`
+        : `最高条件概率低于阈值 ${result.threshold}`;
+    } else {
+      els.cutBestFrame.textContent = "—";
+      els.cutBestProb.textContent = "—";
+      els.cutBestVerdict.textContent = "不宜切开";
+    }
+    els.cutMessage.textContent = result.message || "";
+
+    const reasons = stale ? staleReasonLabel(result) : [];
+    els.cutStale.hidden = !stale;
+    els.cutStale.textContent = stale
+      ? `此建议已过期：${reasons.length ? reasons.join("、") : "输入已变化"}。` +
+        `它属于片段 ${inputs.start_frame}～${inputs.end_frame} 帧、字幕“${inputs.text}”、` +
+        `切分处 ${inputs.split}${result.computed_at ? `、第 ${result.computed_at.next_frame} 帧时` : ""}。` +
+        "请重新计算。"
+      : "";
+
+    els.cutBody.innerHTML = "";
+    (result.boundaries || []).forEach((entry) => {
+      const tr = document.createElement("tr");
+      if (best && entry.cut_frame === best.cut_frame) tr.className = "recommended";
+      if (!entry.probability) tr.classList.add("zero");
+      const frameTd = document.createElement("td");
+      frameTd.textContent = String(entry.cut_frame);
+      const leftTd = document.createElement("td");
+      leftTd.className = "num";
+      leftTd.textContent = `${inputs.start_frame}～${entry.prev_frame}`;
+      const probTd = document.createElement("td");
+      probTd.className = "num";
+      probTd.textContent = entry.probability.toFixed(6);
+      const logTd = document.createElement("td");
+      logTd.className = "num";
+      logTd.textContent = fmt(entry.log_probability);
+      tr.append(frameTd, leftTd, probTd, logTd);
+      els.cutBody.appendChild(tr);
+    });
+  }
+
+  // Apply a suggestion stored on a session snapshot.  It is only a fallback:
+  // a live result received by this tab always wins while its inputs match.
+  // Callers render the adopted suggestion; this function only updates state.
+  function adoptServerCutSuggestion(snap) {
+    const suggestion = snap.cut_suggestion;
+    if (!suggestion) { state.cutExternal = null; return; }
+    if (state.cutExternal && state.cutExternal.order >= suggestion.order) return;
+    state.cutExternal = suggestion;
+  }
+
+  async function requestCutSuggestion() {
+    if (!state.sessionId || !state.snapshot) return;
+    const live = readCutInputs();
+    if (live.start_frame === null || live.end_frame === null || live.split === null) {
+      showError("请填写片段起始帧、结束帧与切分处");
+      return;
+    }
+    if (!Number.isInteger(live.start_frame) || !Number.isInteger(live.end_frame)
+        || !Number.isInteger(live.split)) {
+      showError("帧号与切分处必须是整数");
+      return;
+    }
+    const sessionId = state.sessionId;
+    const generation = state.generation;
+    state.cutSerial += 1;
+    const serial = state.cutSerial;
+    state.cutInFlight += 1;
+    updateCutButtons();
+    try {
+      const payload = await api("/api/cut-suggestion", {
+        method: "POST",
+        body: JSON.stringify({
+          session_id: sessionId,
+          start_frame: live.start_frame,
+          end_frame: live.end_frame,
+          text: live.text,
+          split: live.split,
+        }),
+      });
+      if (generation !== state.generation || sessionId !== state.sessionId) return;
+      const result = payload.result;
+      // A reply is only shown if it is the newest request *and* the form has
+      // not been edited since it was sent.  A late reply for older inputs is
+      // reported but never displayed as the current suggestion.
+      if (result.superseded || serial !== state.cutSerial
+          || !sameCutInputs(result.inputs, readCutInputs())) {
+        showNotice("切点计算结果已过期（输入或会话已变化），未采用。");
+        if (payload.state) {
+          applyState(payload.state);
+          if (payload.state.cut_suggestion) {
+            state.cutExternal = payload.state.cut_suggestion;
+            renderCutSuggestion(state.cutExternal);
+          }
+        }
+        return;
+      }
+      if (payload.state) applyState(payload.state);
+      if (result.status === "ok" && result.best) {
+        state.cutExternal = { ...result };
+        // ``result`` already recorded the exact inputs and session position it
+        // was computed for, so the staleness check will agree with itself.
+        renderCutSuggestion(result);
+        renderCutFailure(null);
+        showError("");
+        hideNotice();
+      } else {
+        // No usable suggestion: the server kept the previous one (and echoed
+        // it in ``state.cut_suggestion``).  Keep showing that, never the
+        // failed attempt, and explain the failure in its own line.
+        if (payload.state && payload.state.cut_suggestion) {
+          state.cutExternal = payload.state.cut_suggestion;
+          renderCutSuggestion(state.cutExternal);
+        } else {
+          renderCutSuggestion(null);
+        }
+        renderCutFailure(payload.state ? payload.state.cut_failure : {
+          message: result.message,
+          inputs: result.inputs,
+        });
+        showError("");
+        hideNotice();
+      }
+    } catch (error) {
+      if (generation !== state.generation || sessionId !== state.sessionId) return;
+      showError(`切点建议失败：${error.message}（旧建议与输入保持不变）`);
+      renderCutFailure({
+        message: `本次尝试未产生建议：${error.message}`,
+        inputs: live,
+      });
+      if (state.cutExternal) renderCutSuggestion(state.cutExternal);
+    } finally {
+      if (generation === state.generation) {
+        state.cutInFlight = Math.max(0, state.cutInFlight - 1);
+        updateCutButtons();
+      }
+    }
   }
 
   // ------------------------------------------------------------- operations
@@ -560,6 +886,9 @@
     state.sessionId = null;
     state.revision = -1;
     state.snapshot = null;
+    state.cutSerial += 1;
+    state.cutInFlight = 0;
+    state.cutExternal = null;
     els.workspace.hidden = true;
     state.loadedSample = null;
     setConnection("idle", "未加载");
@@ -591,6 +920,32 @@
   });
 
   els.undoBtn.addEventListener("click", undo);
+
+  // Cut-point inputs.  Editing any of them bumps ``cutSerial`` so a reply that
+  // is still in flight can no longer be displayed as the current suggestion;
+  // the old result stays visible but renderCutSuggestion marks it stale.
+  els.cutStart.addEventListener("input", () => {
+    state.cutSerial += 1;
+    updateCutSplitPreview();
+    if (state.cutExternal) renderCutSuggestion(state.cutExternal);
+  });
+  els.cutEnd.addEventListener("input", () => {
+    state.cutEndAuto = false;
+    state.cutSerial += 1;
+    updateCutSplitPreview();
+    if (state.cutExternal) renderCutSuggestion(state.cutExternal);
+  });
+  els.cutSplit.addEventListener("input", () => {
+    state.cutSerial += 1;
+    updateCutSplitPreview();
+    if (state.cutExternal) renderCutSuggestion(state.cutExternal);
+  });
+  els.cutText.addEventListener("input", () => {
+    state.cutSerial += 1;
+    updateCutSplitPreview();
+    if (state.cutExternal) renderCutSuggestion(state.cutExternal);
+  });
+  els.cutBtn.addEventListener("click", requestCutSuggestion);
 
   els.stepBtn.addEventListener("click", async () => {
     const snap = state.snapshot;
@@ -678,6 +1033,14 @@
       showError("");
       hideNotice();
       showNotice(`已载入样例「${name}」，共 ${payload.frame_count} 帧。`);
+      // Prefill from the best hypothesis so the first attempt needs one click;
+      // the user can still edit every field.
+      const best = payload.best_text || "";
+      if (best.length >= 2) {
+        els.cutText.value = best;
+        els.cutSplit.value = "1";
+      }
+      render();
     } catch (error) {
       els.setupError.hidden = false;
       els.setupError.textContent = error.message;
